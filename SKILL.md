@@ -1,0 +1,649 @@
+---
+name: workflow-cookbook
+description: Prescriptive cookbook for Claude Code's Workflow tool (ultracode). Load when the user says "ultracode", "use a workflow", "fan out agents", gives a "+Nk" budget, or asks for a thorough review/audit/research/migration. Gives sizing rules, copy-ready script templates, canned lens lists, a pre-flight checklist, and the cost-tier model map so a script is large enough and runs on the first try.
+---
+
+# Workflow cookbook
+
+Companion to the built-in `workflow-authoring` skill. That skill is the API
+reference; this one tells you how big to go and gives you the scripts. Load BOTH
+before writing a script: `workflow-authoring` first, then this file.
+
+## 0. Decision rule
+
+Call the Workflow tool ONLY if one of these is true:
+
+- The prompt contains `ultracode`, or a system-reminder says ultracode is on.
+- The prompt contains a token budget like `+300k` or `+1m`.
+- The user said "use a workflow", "run a workflow", "fan out agents", or "orchestrate with subagents".
+- A slash command's instructions say to call Workflow.
+
+Otherwise do not call it. Say in one line what a workflow could do and offer it.
+
+When ultracode IS on, every substantive task goes through a workflow. Solo work is
+limited to conversational replies and trivial single-file edits.
+
+## 1. The dispatcher rule (most important section)
+
+When ultracode is on, your own context is a DISPATCHER, not a worker. It does
+exactly four things: scout the work list, author and launch workflows, read
+results, relay to the user. The quality of long tasks collapses when the
+dispatcher starts doing the work itself, because its context fills with file
+contents and it loses track of the overall job.
+
+Hard limits on inline work while ultracode is on:
+
+- Read at most 3 files yourself, and only to build the work list for `args`.
+- Edit at most 1 file yourself, and only a trivial change.
+- Write at most one paragraph of analysis yourself. Longer analysis is a workflow.
+- NEVER "finish the rest yourself" after a workflow returns. If rejected files or
+  confirmed findings remain, that is a new workflow over them, not inline work,
+  and never a phase that belonged in the script (section 12).
+- NEVER start the work yourself while a workflow is still running. Waiting is
+  part of dispatching. Section 13 says how to wait.
+
+A heavy job is ONE workflow. Its script runs every phase the job needs and
+hands each phase's result to the next inside the script, as a variable. The
+dispatcher never relays results between phases; that relay is exactly where
+context fills and quality drops. One launch, one wait, one result.
+
+| Phase inside the script | Pattern from | Hands the next phase |
+|---|---|---|
+| Understand | 9b | an overview plus the file list the job touches |
+| Design | 9c | one plan with the files to change and the tests to run |
+| Implement | 9e | verified diffs, retried once in-script when refuted |
+| Review | 9a | confirmed findings over the diffs |
+| Report | one top-tier agent | what to apply, what was left out, and why |
+
+Template 9g is this shape end to end. Do not break it into one invocation per
+phase to "stay in the loop". If a later phase goes wrong, edit the script and
+resume: every earlier phase is cached, so nothing is lost by running them
+together. Split into separate workflows only at a point where the USER must
+choose before the next phase can be specified, for example picking between two
+designs with different cost, or where the next phase's work list cannot be
+derived by the script from the previous result. Those are rare.
+
+## 2. Sizing follows the work, not a constant
+
+Never decide size by feel, and never apply one global number. Two rules:
+
+1. **Each step's agent count is a function of that step's own work items**, with
+   a ceiling. Three modules to read means three readers. Two files to review
+   means two lenses, not six. Counts differ from step to step because the work
+   does. Work out the list for each step, then take one agent per item.
+2. **The budget raises the ceiling, never lowers it.** When the operator gave
+   `+Nk`, size up toward it; the runtime enforces it as a hard limit. With no
+   budget, the ceiling column below applies.
+
+```js
+const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n))
+const B = budget.total || 0                        // 0 when no +Nk was given
+const ceiling = (base) => B ? Math.max(base, Math.floor(B / 100_000)) : base
+```
+
+| Task shape | Count = one per | Small job | Heavy job ceiling |
+|---|---|---|---|
+| Review / audit | file touched, times lens | 1 lens | 10 lenses |
+| Understand | module / package | 1 reader | 6 readers |
+| Design | distinct angle | 2 proposals | 5 proposals, 3 judges |
+| Research | sweep mode (7 canned) | 3 modes | 7 modes + 1 critic |
+| Migrate / implement | changed file | 1 transformer + 1 verifier | every file |
+| Discovery loop | lens, each round | full lens set | cap 8 rounds |
+
+Refuters stay at 3 per finding: a majority verdict needs three, so that one does
+not scale down. Everything else scales with its step's work list.
+
+**A step exists only if it produces something the next step consumes.** The phase
+lists under section 9 are the shape for that kind of task, not a mandated number
+of steps. A two-file change may be one fan-out plus one synthesis. A full audit
+may be five steps. Let the work decide the step count, subject to one invariant:
+every load-bearing claim is checked by something independent of what produced it.
+A single fan-out with no check of any kind is the shortcut to avoid, not the
+short workflow.
+
+Agents per workflow therefore range widely: a handful for a small task, 20 to 80
+for a heavy one. Both are correct when the count matches the work.
+
+## 3. Why a large fan-out is safe
+
+The runtime is built for it. None of these require caution on your part:
+
+- Concurrency is capped automatically (about 10 to 16 at once). Passing 100 items
+  just queues them. You do not manage parallelism.
+- `agent()` never throws on a failed subagent. It returns `null`. `parallel()`
+  never rejects. A throwing pipeline stage drops only that item.
+- The budget is a hard ceiling. When it is exhausted `agent()` throws, the script
+  stops, and you still get everything completed so far via the journal.
+- Resume caches every completed `agent()` call. Editing and re-running a 60-agent
+  script re-runs only the changed tail.
+- Hard caps exist (1000 agents per run, 4096 items per call). You cannot run away.
+
+A 50-agent workflow is not riskier than a 3-agent one. It only takes longer.
+
+## 4. Hybrid pattern: scout, then orchestrate
+
+Build the concrete work list inline first (Glob, Grep, `git diff --name-only`,
+`ls`), within the section 1 limits, then pass it as `args`:
+
+```
+Workflow({ script: "<script>", args: { files: ["src/a.ts", "src/b.ts"], question: "..." } })
+```
+
+`args` is a real JSON value in the tool call, never a JSON-encoded string.
+
+## 5. Hard rules the parser and sandbox enforce
+
+- `export const meta = {...}` is the FIRST statement and a PURE LITERAL. No
+  variables, calls, template strings, or spreads inside it.
+- `meta.name` and `meta.description` are required. `meta.phases[].title` must
+  match `phase('...')` and `opts.phase` strings exactly.
+- Plain JavaScript. No TypeScript syntax. Top-level `await` and `return` work.
+- FORBIDDEN: `Date.now()`, `Math.random()`, `new Date()` with no args, `import`,
+  `require`, `fs`, `fetch`, `process`.
+- Schemas: root is `{type:'object', properties:{...}}`; `required` is a subset of
+  `properties`.
+- `agent()` can return `null`. Always `.filter(Boolean)` arrays and `?.` singles.
+- `parallel()` takes thunks: `items.map(x => () => agent(...))`.
+- `pipeline()` stage callbacks receive `(prevResult, originalItem, index)`.
+
+Shape rules that keep a generated script parseable. The parse error observed on
+this backend, `Unexpected token` at column 0 of a `phase(...)` line, is what
+breaking these produces. It is not a TypeScript error, whatever the harness
+message suggests:
+
+- One `agent()` call per statement, named: `const read = m => agent(...)`. Then
+  `await fan(items, read)`. Never write `(await parallel(items.map(x => () =>
+  agent(...)))).filter(Boolean)` inline; its five closing parens are where the
+  count goes wrong. `fan` is defined in section 9 and does the same thing.
+- No backtick inside prompt text. Name files and symbols bare: `Read src/a.ts`,
+  not `Read \`src/a.ts\``. A stray backtick ends the template literal and the
+  parser resumes mid-sentence several lines later.
+- No nested template literal inside `${...}`. Compute the piece into a `const`
+  on the line above and interpolate the name.
+- Prompts are template literals, never single-quoted strings, so apostrophes in
+  prose cannot end the string.
+- Never start a line with `(`, `[`, or a backtick. The parser glues it to the
+  previous line. Begin lines with `const`, `let`, `await`, `if`, `for`, `log`, or
+  `return`.
+- Run the checker before calling Workflow (section 11, item 16).
+
+Reading a parse error. The line and column are where the parser gave up, which
+is usually AFTER the fault:
+
+| Message | At | Cause | Fix |
+|---|---|---|---|
+| `Unexpected token` | column 0 of a line that begins a new statement, such as `phase('Design')` or `const x` | an unclosed `(`, `[`, or `{` in the statement above, or a stray backtick that swallowed the line ends | balance the previous statement; search the prompt text above for backticks |
+| `Unterminated template` | end of script | odd number of backticks | find the backtick inside prompt text |
+| `Unterminated string constant` | inside a line | apostrophe inside a single-quoted string | make it a template literal |
+| `Unexpected token` | at a `:` after a parameter name | TypeScript annotation | delete the annotation |
+| `Unexpected token` | at `<` or `as` | TypeScript generic or cast | delete it |
+| meta error | line 1 | non-literal `meta` | inline every value |
+
+The checker in section 11 uses node, whose wording differs from the harness
+parser: `Unexpected identifier 'phase'` for the unclosed-bracket case and
+`missing ) after argument list` for a backtick inside prompt text. Read the line
+number it prints and apply the same fixes.
+
+## 6. pipeline vs parallel
+
+Default to `pipeline`. Use `parallel` as a barrier only when the next stage needs
+ALL prior results together: dedup/merge across the set, early exit on zero total,
+or a prompt that compares against "the other findings". Flatten/map/filter between
+stages is not a barrier; do it inside a pipeline stage.
+
+## 7. Cost tiers
+
+Declare these right after `meta` in every script. The operator maps the aliases
+to real backend model IDs via environment variables, so scripts stay portable.
+
+```js
+const MODEL_CHEAP = 'haiku'    // search, grep, reformat, sweeps
+const MODEL_MID   = 'sonnet'   // finders, readers, transformers, single-lens checks
+const MODEL_HIGH  = 'opus'     // refuters, design proposals, tricky verification
+const MODEL_TOP   = 'fable'    // final synthesis, judges, scoring, decisive verification
+```
+
+Quality takes priority at the stages that decide the outcome. Keep Fable for
+final synthesis, design judges, scoring competing outputs, and decisive
+verification. Routine readers, finders, and transformers still use cheaper tiers.
+Escalate ambiguous or disputed findings to a Fable verifier rather than deciding
+by cheap-model majority alone. Do not silently replace the top tier with Opus to
+save cost. If the Fable endpoint is unavailable, report the blocked stage and
+request an approved replacement.
+
+All four are aliases on purpose. The operator maps them to real backend model IDs
+through environment variables, so a single env change re-points every tier and no
+script needs editing. `MODEL_TOP` uses the `fable` alias, which resolves through
+`ANTHROPIC_DEFAULT_FABLE_MODEL`. Do not paste a raw model ID into these constants
+instead; it would break that portability.
+
+A client-side `behavesAs` profile does not establish equivalent model quality, so
+never treat a `behavesAs`-labelled picker entry as a substitute for the alias.
+
+To use the session model, omit `model`. Use `effort` only if the operator has
+confirmed the backend accepts it.
+
+## 8. Canned lens lists
+
+Fan-out needs N distinct prompts. Do not invent them each time; slice these.
+
+```js
+const REVIEW_LENSES = [
+  'correctness: logic errors, off-by-one, wrong conditions, unhandled states',
+  'error handling: swallowed errors, missing propagation, misleading messages',
+  'concurrency: races, missing awaits, shared mutable state, ordering',
+  'security: injection, authz gaps, secrets, unsafe deserialization, path traversal',
+  'resource lifecycle: leaks, unclosed handles, unbounded growth, missing cleanup',
+  'API contract: callers broken by the change, type mismatches, nullability',
+  'tests: untested branches, tests that pass for the wrong reason, missing negatives',
+  'performance: N+1, needless copies, hot-path allocations, quadratic loops',
+  'readability: misleading names, dead code, duplicated logic that will drift',
+  'data integrity: migrations, partial writes, idempotency, retry safety',
+]
+
+const SWEEP_MODES = [
+  'by filename and directory names',
+  'by symbol: function, class, and type names',
+  'by string literals, log messages, and error text',
+  'by config keys, env vars, and feature flags',
+  'by git history: commits and blame touching the topic',
+  'by tests: test names and fixtures that mention the topic',
+  'by docs and comments: README, ADRs, inline docs',
+]
+
+const DESIGN_ANGLES = ['MVP-first', 'risk-first', 'user-experience-first', 'operability-first', 'performance-first']
+
+const VERIFY_LENSES = ['correctness: is the claim actually true in this code', 'reproduction: can it be triggered with a concrete input', 'impact: does it matter in practice or is it theoretical']
+```
+
+Take `REVIEW_LENSES.slice(0, FLEET)` and so on. If FLEET exceeds the list, repeat
+lenses with a different `label` suffix and a different file subset.
+
+## 9. Templates
+
+Shared definitions used below. Every agent prompt in these templates ends with
+`${AGENT_RULES}`; keep it there. It is what stops a subagent from reporting to
+the main conversation instead of returning to the script. `fan` is the only
+way these templates fan out; it keeps the closing parens to one per line.
+
+```js
+const FINDINGS = { type: 'object', properties: { findings: { type: 'array', items: { type: 'object', properties: { file: { type: 'string' }, line: { type: 'integer' }, title: { type: 'string' }, detail: { type: 'string' }, severity: { type: 'string', enum: ['high', 'medium', 'low'] } }, required: ['file', 'title', 'detail', 'severity'] } } }, required: ['findings'] }
+const VERDICT  = { type: 'object', properties: { refuted: { type: 'boolean' }, reason: { type: 'string' } }, required: ['refuted', 'reason'] }
+const AGENT_RULES = 'Your final text is your return value and the script collects it. Do not call SendMessage or ListAgents; nothing needs to reach the main conversation. Put everything the script needs in this response.'
+// fan(items, fn): run fn(item, index) over every item concurrently, drop nulls.
+const fan = async (items, fn) => (await parallel(items.map((x, i) => () => fn(x, i)))).filter(Boolean)
+```
+
+Each template below lifts every `agent()` call into a named one-line function,
+then fans out or pipelines over the names. Keep that shape when adapting them.
+
+### 9a. Review (find by lens, verify by 3 lenses, synthesize)
+
+```js
+export const meta = { name: 'review', description: 'Multi-lens review with adversarial verification', phases: [{ title: 'Find' }, { title: 'Verify' }, { title: 'Synthesize' }] }
+const MODEL_CHEAP = 'haiku', MODEL_MID = 'sonnet', MODEL_HIGH = 'opus', MODEL_TOP = 'fable'
+const REVIEW_LENSES = [/* paste from section 8 */]
+const VERIFY_LENSES = [/* paste from section 8 */]
+const FINDINGS = /* section 9 */, VERDICT = /* section 9 */, AGENT_RULES = /* section 9 */, fan = /* section 9 */
+
+const B = budget.total || 0
+const files = args.files
+const fileList = files.join(', ')
+const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n))
+// One lens per file, floored at 2 and capped by the lens list; a +Nk budget raises the cap.
+const CAP = B ? Math.max(REVIEW_LENSES.length, Math.floor(B / 100_000)) : REVIEW_LENSES.length
+const FLEET = clamp(files.length, 2, CAP)
+log(`review: ${files.length} files, ${FLEET} lenses`)
+
+const key = f => `${f.file}:${f.line ?? 0}:${f.title}`
+const seen = new Set()
+
+const find = lens => agent(`Review these files through ONE lens only: ${lens}.\nFiles: ${fileList}\nRead each file fully. Report only concrete defects with file and line.\n${AGENT_RULES}`, { label: `find:${lens.split(':')[0]}`, phase: 'Find', schema: FINDINGS, model: MODEL_MID })
+const refute = (f, lens) => agent(`Lens: ${lens}.\nTry to REFUTE this finding. Read the code yourself. Default to refuted=true if uncertain.\n${JSON.stringify(f)}\n${AGENT_RULES}`, { label: `verify:${f.file}`, phase: 'Verify', schema: VERDICT, model: MODEL_HIGH })
+const dedupe = found => {
+  const fresh = (found?.findings ?? []).filter(f => !seen.has(key(f)))
+  fresh.forEach(f => seen.add(key(f)))
+  return fresh
+}
+const judge = async f => {
+  const votes = await fan(VERIFY_LENSES, lens => refute(f, lens))
+  return { ...f, votes, survives: votes.filter(v => !v.refuted).length >= 2 }
+}
+
+const verified = await pipeline(REVIEW_LENSES.slice(0, FLEET), find, dedupe, fresh => fan(fresh, judge))
+const confirmed = verified.flat().filter(Boolean).filter(f => f.survives)
+log(`${seen.size} raw findings, ${confirmed.length} confirmed`)
+const report = await agent(`Write the review report. Most severe first. Each item: file:line, what is wrong, why it matters, suggested fix.\n${JSON.stringify(confirmed, null, 2)}\n${AGENT_RULES}`, { phase: 'Synthesize', model: MODEL_TOP })
+return { confirmed, report }
+```
+
+Call with `args: { files: [...] }`. The dedup here is per-lens against a shared
+`seen`, which is fine inside a pipeline because `Set` is shared across items.
+
+### 9b. Understand (one reader per module, merge)
+
+```js
+export const meta = { name: 'understand', description: 'Map every module in parallel, then merge', phases: [{ title: 'Read' }, { title: 'Merge' }] }
+const MODEL_MID = 'sonnet', MODEL_TOP = 'fable'
+const AGENT_RULES = /* section 9 */, fan = /* section 9 */
+const MAP = { type: 'object', properties: { module: { type: 'string' }, purpose: { type: 'string' }, entrypoints: { type: 'array', items: { type: 'string' } }, dependsOn: { type: 'array', items: { type: 'string' } }, risks: { type: 'array', items: { type: 'string' } } }, required: ['module', 'purpose'] }
+log(`understand: ${args.modules.length} modules`)
+const read = m => agent(`Read every file under ${m}. Describe purpose, entrypoints, dependencies, and risks. Facts only.\n${AGENT_RULES}`, { label: `read:${m}`, phase: 'Read', schema: MAP, model: MODEL_MID })
+const maps = await fan(args.modules, read)
+const merged = await agent(`Merge into one architecture overview with a dependency list and the top risks:\n${JSON.stringify(maps)}\n${AGENT_RULES}`, { phase: 'Merge', model: MODEL_TOP })
+return { maps, merged }
+```
+
+Call with `args: { modules: [...] }`: one reader per module or package the task
+touches. A two-module job gets two readers, not six.
+
+### 9c. Design (judge panel)
+
+```js
+export const meta = { name: 'design-panel', description: 'Independent designs from several angles, judged, synthesized', phases: [{ title: 'Propose' }, { title: 'Judge' }, { title: 'Synthesize' }] }
+const MODEL_HIGH = 'opus', MODEL_TOP = 'fable'
+const DESIGN_ANGLES = [/* section 8 */]
+const AGENT_RULES = /* section 9 */, fan = /* section 9 */
+const SCORE = { type: 'object', properties: { scores: { type: 'array', items: { type: 'object', properties: { index: { type: 'integer' }, score: { type: 'number' }, why: { type: 'string' } }, required: ['index', 'score'] } } }, required: ['scores'] }
+const B = budget.total || 0
+// 2 proposals for a small design, up to the angle list; a +Nk budget adds rows.
+const N = Math.max(2, Math.min(DESIGN_ANGLES.length, 2 + Math.floor(B / 150_000)))
+const propose = a => agent(`Problem: ${args.problem}\nContext: ${args.context}\nDesign a solution from the ${a} angle. Return the design as text with tradeoffs.\n${AGENT_RULES}`, { label: `propose:${a}`, phase: 'Propose', model: MODEL_HIGH })
+const proposals = await fan(DESIGN_ANGLES.slice(0, N), propose)
+const listed = proposals.map((p, i) => '--- #' + i + '\n' + p).join('\n')
+const score = j => agent(`Judge #${j + 1}. Score each proposal 0-10 against: ${args.problem}\n${listed}\n${AGENT_RULES}`, { phase: 'Judge', schema: SCORE, model: MODEL_TOP })
+const judged = await fan([0, 1, 2], score)
+const totals = proposals.map((_, i) => judged.reduce((t, j) => t + (j.scores.find(x => x.index === i)?.score ?? 0), 0))
+const best = totals.indexOf(Math.max(...totals))
+log(`winner #${best}, totals ${JSON.stringify(totals)}`)
+const others = proposals.filter((_, i) => i !== best).join('\n---\n')
+const final = await agent(`Synthesize the final design from the winner, grafting the best ideas from the others. End with an ordered implementation plan listing files to change.\nWinner:\n${proposals[best]}\nOthers:\n${others}\n${AGENT_RULES}`, { phase: 'Synthesize', model: MODEL_TOP })
+return { final, totals }
+```
+
+Call with `args: { problem, context }` where context is the merged output of 9b.
+
+### 9d. Research (sweep, read all hits, critique, synthesize)
+
+```js
+export const meta = { name: 'research', description: 'Multi-mode sweep, read every hit, critique gaps, answer', phases: [{ title: 'Sweep' }, { title: 'Read' }, { title: 'Critique' }] }
+const MODEL_CHEAP = 'haiku', MODEL_MID = 'sonnet', MODEL_TOP = 'fable'
+const SWEEP_MODES = [/* section 8 */]
+const AGENT_RULES = /* section 9 */, fan = /* section 9 */
+const HITS = { type: 'object', properties: { hits: { type: 'array', items: { type: 'string' } } }, required: ['hits'] }
+const CAP = 40
+const sweep = m => agent(`Search ${m} for anything relevant to: ${args.question}. Return file paths only.\n${AGENT_RULES}`, { label: `sweep:${m.slice(3, 20)}`, phase: 'Sweep', schema: HITS, model: MODEL_CHEAP })
+const sweeps = await fan(SWEEP_MODES, sweep)
+const list = [...new Set(sweeps.flatMap(r => r.hits))]
+if (list.length > CAP) log(`capping reads at ${CAP} of ${list.length}; dropped: ${list.slice(CAP).join(', ')}`)
+const read = f => agent(`Read ${f} in full. Extract everything relevant to: ${args.question}. Facts only, cite line numbers.\n${AGENT_RULES}`, { label: `read:${f}`, phase: 'Read', model: MODEL_MID })
+const notes = await fan(list.slice(0, CAP), read)
+const joined = notes.join('\n---\n')
+const critique = await agent(`Question: ${args.question}\nNotes:\n${joined}\n\nFirst list what is missing: unverified claims, sources not read, search modes that would find more. Then answer the question as completely as the notes allow.\n${AGENT_RULES}`, { phase: 'Critique', model: MODEL_TOP })
+return { files: list, answer: critique }
+```
+
+If the critique names gaps, close them inside the same script: give the critique
+a schema with a `gaps: string[]` field and loop, running another sweep and read
+round over the gaps until the list is empty or three rounds have run. Do not end
+the workflow and relaunch for the gaps, and do not read them inline.
+
+### 9e. Implement / migrate (one agent per file, verified)
+
+```js
+export const meta = { name: 'implement', description: 'Apply a change per file in isolated worktrees, verify each', phases: [{ title: 'Transform' }, { title: 'Verify' }] }
+const MODEL_MID = 'sonnet', MODEL_HIGH = 'opus'
+const AGENT_RULES = /* section 9 */, VERDICT = /* section 9 */
+const RESULT = { type: 'object', properties: { changed: { type: 'boolean' }, diff: { type: 'string' }, notes: { type: 'string' } }, required: ['changed'] }
+log(`implement: ${args.files.length} files`)
+const tx = f => agent(`Task: ${args.task}\nApply it to ${f} only. Do not commit. Return the unified diff.\n${AGENT_RULES}`, { label: `tx:${f}`, phase: 'Transform', schema: RESULT, isolation: 'worktree', model: MODEL_MID })
+const check = (f, r) => agent(`Task was: ${args.task}\nCheck this diff for ${f}: does it compile, preserve behavior, and fully do the task? Refute if any answer is no.\n${r.diff}\n${AGENT_RULES}`, { label: `verify:${f}`, phase: 'Verify', schema: VERDICT, model: MODEL_HIGH })
+const verify = async (r, f) => {
+  if (!r?.changed) return null
+  const verdict = await check(f, r)
+  return { file: f, diff: r.diff, verdict }
+}
+const out = await pipeline(args.files, tx, verify)
+const results = out.filter(Boolean)
+log(`${results.length} changed, ${results.filter(r => r.verdict?.refuted).length} refuted`)
+return results
+```
+
+Call with `args: { files: [...], task: "..." }`. Worktree isolation is required
+here because files are edited concurrently. Applying the surviving diffs is the
+one inline step allowed afterwards. Refuted files are retried inside the script,
+not in a second workflow: add a stage that re-runs the transform with the
+verdict's reason appended to the prompt, then verifies again, as in 9g.
+
+### 9f. Discovery loop (until dry)
+
+```js
+const seen = new Set(), confirmed = []
+const fileList = args.files.join(', ')
+let dry = 0, round = 0
+while (dry < 2 && round < 8) {
+  round++
+  const known = [...seen].join('\n')
+  const find = (lens, i) => agent(`Round ${round}. Lens: ${lens}. Find defects in ${fileList} not in this list:\n${known}\n${AGENT_RULES}`, { label: `find:${i}`, phase: 'Find', schema: FINDINGS, model: MODEL_MID })
+  const found = (await fan(REVIEW_LENSES.slice(0, FLEET), find)).flatMap(r => r.findings)
+  const fresh = found.filter(f => !seen.has(key(f)))
+  if (!fresh.length) { dry++; continue }
+  dry = 0
+  fresh.forEach(f => seen.add(key(f)))
+  const judged = await fan(fresh, judge)   // judge as defined in 9a
+  confirmed.push(...judged.filter(j => j.survives))
+  log(`round ${round}: ${fresh.length} new, ${confirmed.length} confirmed`)
+}
+```
+
+Dedup against `seen`, not `confirmed`, or rejected findings reappear each round.
+
+### 9g. End-to-end job (understand, design, implement, review, report)
+
+The default for any heavy job. Each phase sizes itself from the list the previous
+phase produced, so counts differ by phase as section 2 requires.
+
+```js
+export const meta = { name: 'job', description: 'Understand, design, implement, review and report one job in a single run', phases: [{ title: 'Understand' }, { title: 'Design' }, { title: 'Implement' }, { title: 'Review' }, { title: 'Report' }] }
+const MODEL_CHEAP = 'haiku', MODEL_MID = 'sonnet', MODEL_HIGH = 'opus', MODEL_TOP = 'fable'
+const REVIEW_LENSES = [/* section 8 */], VERIFY_LENSES = [/* section 8 */], DESIGN_ANGLES = [/* section 8 */]
+const FINDINGS = /* section 9 */, VERDICT = /* section 9 */, AGENT_RULES = /* section 9 */, fan = /* section 9 */
+const MAP = { type: 'object', properties: { module: { type: 'string' }, purpose: { type: 'string' }, files: { type: 'array', items: { type: 'string' } }, risks: { type: 'array', items: { type: 'string' } } }, required: ['module', 'purpose', 'files'] }
+const OVERVIEW = { type: 'object', properties: { overview: { type: 'string' }, files: { type: 'array', items: { type: 'string' } } }, required: ['overview', 'files'] }
+const SCORE = { type: 'object', properties: { scores: { type: 'array', items: { type: 'object', properties: { index: { type: 'integer' }, score: { type: 'number' }, why: { type: 'string' } }, required: ['index', 'score'] } } }, required: ['scores'] }
+const PLAN = { type: 'object', properties: { design: { type: 'string' }, files: { type: 'array', items: { type: 'object', properties: { path: { type: 'string' }, change: { type: 'string' } }, required: ['path', 'change'] } }, tests: { type: 'array', items: { type: 'string' } } }, required: ['design', 'files'] }
+const RESULT = { type: 'object', properties: { changed: { type: 'boolean' }, diff: { type: 'string' }, notes: { type: 'string' } }, required: ['changed'] }
+const B = budget.total || 0
+const low = () => B && budget.remaining() < 60_000
+const task = args.task
+
+// Understand: one reader per module the task names.
+log(`understand: ${args.modules.length} modules`)
+const read = m => agent(`Task context: ${task}\nRead every file under ${m}. Describe purpose and risks, and list the files that this task would plausibly touch. Facts only.\n${AGENT_RULES}`, { label: `read:${m}`, phase: 'Understand', schema: MAP, model: MODEL_MID })
+const maps = await fan(args.modules, read)
+const mapsJson = JSON.stringify(maps)
+const understood = await agent(`Task: ${task}\nMerge these module maps into one overview and the deduplicated list of files the task touches:\n${mapsJson}\n${AGENT_RULES}`, { phase: 'Understand', schema: OVERVIEW, model: MODEL_TOP })
+if (!understood) return { stopped: 'understand returned nothing', maps }
+
+// Design: proposals from distinct angles, judged, synthesized into a plan.
+const N = Math.max(2, Math.min(DESIGN_ANGLES.length, 2 + Math.floor(B / 150_000)))
+const involved = understood.files.join(', ')
+const propose = a => agent(`Task: ${task}\nCodebase overview:\n${understood.overview}\nFiles involved: ${involved}\nDesign a solution from the ${a} angle, with tradeoffs.\n${AGENT_RULES}`, { label: `propose:${a}`, phase: 'Design', model: MODEL_HIGH })
+const proposals = await fan(DESIGN_ANGLES.slice(0, N), propose)
+const listed = proposals.map((p, i) => '--- #' + i + '\n' + p).join('\n')
+const score = j => agent(`Judge #${j + 1}. Score each proposal 0-10 for: ${task}\n${listed}\n${AGENT_RULES}`, { phase: 'Design', schema: SCORE, model: MODEL_TOP })
+const judged = await fan([0, 1, 2], score)
+const totals = proposals.map((_, i) => judged.reduce((t, j) => t + (j.scores.find(x => x.index === i)?.score ?? 0), 0))
+const best = totals.indexOf(Math.max(...totals))
+log(`design: winner #${best}, totals ${JSON.stringify(totals)}`)
+const others = proposals.filter((_, i) => i !== best).join('\n---\n')
+const plan = await agent(`Task: ${task}\nSynthesize the final design from the winner, grafting the best ideas from the others. Return the design, the exact files to change with the change for each, and the tests to run.\nWinner:\n${proposals[best]}\nOthers:\n${others}\n${AGENT_RULES}`, { phase: 'Design', schema: PLAN, model: MODEL_TOP })
+if (!plan?.files?.length) return { understood, proposals, totals, stopped: 'design produced no file list' }
+if (low()) { log('budget low after design; stopping before implement'); return { understood, plan, stopped: 'budget' } }
+
+// Implement: one transformer per planned file, verified, retried once with the verdict.
+log(`implement: ${plan.files.length} files`)
+const tx = (f, extra) => agent(`Task: ${task}\nDesign:\n${plan.design}\nApply this change to ${f.path} only: ${f.change}${extra}\nDo not commit. Return the unified diff.\n${AGENT_RULES}`, { label: `tx:${f.path}`, phase: 'Implement', schema: RESULT, isolation: 'worktree', model: MODEL_MID })
+const check = (f, r) => agent(`Task: ${task}\nIntended change for ${f.path}: ${f.change}\nDoes this diff compile, preserve unrelated behavior, and fully make the intended change? Refute if any answer is no.\n${r.diff}\n${AGENT_RULES}`, { label: `verify:${f.path}`, phase: 'Implement', schema: VERDICT, model: MODEL_HIGH })
+const verifyWithRetry = async (r, f) => {
+  if (!r?.changed) return null
+  let v = await check(f, r)
+  if (v && !v.refuted) return { file: f.path, diff: r.diff, verdict: v, retried: false }
+  const reason = v?.reason ?? 'unknown'
+  const r2 = await tx(f, `\nA previous attempt was refuted for this reason: ${reason}. Fix that.`)
+  if (!r2?.changed) return { file: f.path, diff: r.diff, verdict: v, retried: true }
+  v = await check(f, r2)
+  return { file: f.path, diff: r2.diff, verdict: v, retried: true }
+}
+const implemented = (await pipeline(plan.files, f => tx(f, ''), verifyWithRetry)).filter(Boolean)
+const accepted = implemented.filter(x => x.verdict && !x.verdict.refuted)
+const rejected = implemented.filter(x => !x.verdict || x.verdict.refuted)
+log(`implement: ${accepted.length} accepted, ${rejected.length} rejected after retry`)
+
+// Review: lenses over the accepted diffs, each finding refuted by three lenses.
+const key = f => `${f.file}:${f.line ?? 0}:${f.title}`
+const seen = new Set()
+const diffText = accepted.map(a => '--- ' + a.file + '\n' + a.diff).join('\n')
+const LENSES = REVIEW_LENSES.slice(0, Math.max(2, Math.min(REVIEW_LENSES.length, accepted.length)))
+const find = lens => agent(`Review these diffs through ONE lens only: ${lens}.\nTask: ${task}\n${diffText}\nReport only concrete defects with file and line.\n${AGENT_RULES}`, { label: `find:${lens.split(':')[0]}`, phase: 'Review', schema: FINDINGS, model: MODEL_MID })
+const refute = (f, lens) => agent(`Lens: ${lens}.\nTry to REFUTE this finding against the diff. Default to refuted=true if uncertain.\n${JSON.stringify(f)}\nDiff:\n${diffText}\n${AGENT_RULES}`, { label: `verify:${f.file}`, phase: 'Review', schema: VERDICT, model: MODEL_HIGH })
+const dedupe = found => {
+  const fresh = (found?.findings ?? []).filter(f => !seen.has(key(f)))
+  fresh.forEach(f => seen.add(key(f)))
+  return fresh
+}
+const judge = async f => {
+  const votes = await fan(VERIFY_LENSES, lens => refute(f, lens))
+  return { ...f, survives: votes.filter(v => !v.refuted).length >= 2 }
+}
+const reviewed = await pipeline(LENSES, find, dedupe, fresh => fan(fresh, judge))
+const confirmed = reviewed.flat().filter(Boolean).filter(f => f.survives)
+log(`review: ${seen.size} raw, ${confirmed.length} confirmed`)
+
+// Report: one top-tier agent writes what to apply and what is left.
+const rejectedJson = JSON.stringify(rejected.map(r => ({ file: r.file, reason: r.verdict?.reason })))
+const confirmedJson = JSON.stringify(confirmed, null, 2)
+const tests = (plan.tests ?? []).join(', ')
+const report = await agent(`Write the final report for: ${task}\nDesign:\n${plan.design}\nAccepted diffs: ${accepted.map(a => a.file).join(', ')}\nRejected after retry: ${rejectedJson}\nConfirmed review findings:\n${confirmedJson}\nTests to run: ${tests}\nState what to apply, what to fix first, and what was left out and why.\n${AGENT_RULES}`, { phase: 'Report', model: MODEL_TOP })
+return { understood, plan, totals, accepted, rejected, confirmed, report }
+```
+
+Call with `args: { task: "...", modules: [...] }` where `modules` is the scouted
+list of directories the task touches. The dispatcher's only inline step after
+the result is applying the accepted diffs. If the report names rejected files or
+confirmed findings worth fixing, that is a new, smaller job: one more workflow
+over those files, not inline edits.
+
+## 10. Writing agent prompts
+
+- First sentence is the task, last sentence is the return shape.
+- End every prompt with `AGENT_RULES`. Without it a subagent may report to the
+  main conversation instead of returning, which wakes the dispatcher and leaves
+  the script's structured results stale. Never write a prompt that asks an agent
+  to notify, report to, or message main.
+- Inline every fact the agent needs. It does not see this conversation.
+- Refuters: say "Default to refuted=true if uncertain." Readers: say "Facts only."
+- Never tell an agent to read CLAUDE.md. It already has it.
+- With a schema, do not also ask for prose.
+- Prompt text contains no backticks and no nested `${`...`}`. Name files bare;
+  precompute joined lists into a `const` and interpolate the name (section 5).
+
+## 11. Pre-flight checklist
+
+1. Opt-in present (section 0)?
+2. Sizing derived from the step's own work list, per section 2, with the budget only raising the cap? Counts differ between steps because the work does?
+3. Does each step produce something the next one consumes, and is every load-bearing claim checked by something independent?
+4. Does the script run EVERY phase of the job, so one launch and one wait cover it? A second launch you planned for a later phase belongs inside this script.
+5. Is there any work you planned to do inline afterwards that should be in the script?
+6. `meta` first, literal, with name and description; phase titles match?
+7. No `Date.now`, `Math.random`, `new Date()`, TypeScript, imports?
+8. Every `parallel` argument is an array of thunks?
+9. Every result array `.filter(Boolean)`-ed?
+10. Schemas: object root, `required` subset of `properties`?
+11. `args` passed as real JSON?
+12. Model tier set per stage?
+13. Any cap or sampling is `log()`-ed with what was dropped?
+14. Does every agent prompt end with `AGENT_RULES`, so no subagent messages main?
+15. Will you run `date`, state the expected wall clock with the `runId`
+    (section 13), and then end the turn rather than act while it runs?
+16. Checked the syntax? Write the exact script you are about to submit to
+    `.tmp/wf.js` and run
+    `python3 ~/.claude/skills/workflow-cookbook/check-script.py .tmp/wf.js`.
+    It parses the script the way the tool does and prints the node error with
+    the line number. Fix until it prints `ok`, then submit the same text. One
+    Bash call is cheaper than a failed launch and a re-author.
+
+## 12. After the run
+
+- The tool returns immediately with `runId` and `scriptPath`. The result arrives
+  later as a task notification. Do not predict it. Until it arrives, section 13
+  applies.
+- Odd or empty result: Read `<transcriptDir>/journal.jsonl` first.
+- To fix: Edit the file at `scriptPath`, TaskStop the old run, then
+  `Workflow({ scriptPath, resumeFromRunId })`. Only the changed tail re-runs.
+- Relay the outcome in your own words. A further workflow is for a new job, or
+  for rejected files and confirmed findings the report names. It is never for a
+  phase that should have been in the script. Re-read section 1 before doing
+  anything inline.
+
+## 13. Waiting for a run (slow backends)
+
+The Workflow tool returns at once. The run continues in the background and its
+result arrives as a `<task-notification>` naming your `runId`, which re-enters
+your context on its own. There is nothing for you to do until then. The backend
+behind this harness is noticeably slower than the public API, so one agent turn
+can take several minutes and a three-stage run of 30 agents routinely takes 30
+to 90 minutes. That is normal. Silence is not a hang.
+
+**Ending the turn is the correct action, not giving up.** The harness rule "end
+your turn only when the task is complete or you are blocked on input only the
+user can provide" is satisfied here: a running workflow is input you cannot
+produce yourself. Waiting for it by ending the turn obeys that rule. Continuing
+to act instead violates the dispatcher rule in section 1.
+
+At launch, do these three things, then end the turn:
+
+1. Run `date` once. You have no clock; without a recorded start time, "how long
+   has it been" is a guess, and guesses on a slow backend run short.
+2. Compute the expected wall clock:
+
+   ```
+   minutes ≈ stages × ceil(agents_per_stage / 12) × minutes_per_agent
+   ```
+
+   Use 3 to 10 for `minutes_per_agent` and the largest stage for
+   `agents_per_stage`. Nothing is late until twice that estimate.
+3. Write one line to the user containing the `runId`, the start time, and the
+   estimate. That line is also your own record: it survives context compaction,
+   so a later version of you does not re-launch a run that is still going.
+
+While a run is in flight:
+
+- Do not poll. No repeated reads of `journal.jsonl`, no `/workflows` loops, no
+  "checking in" messages, no ScheduleWakeup shorter than 20 minutes.
+- Do not TaskStop a run because time has passed. Elapsed time is not evidence of
+  failure. The only grounds to stop a run are: the user asks, or the journal
+  shows a script error. Budget exhaustion stops the run by itself.
+- Do not launch the same script again "in case the first one was lost". Two live
+  runs double the cost and both write results.
+- Do not launch a second workflow for the same job while the first runs. Its
+  phases are already inside the script. A workflow for an unrelated job may run
+  alongside it.
+- Do not start the work inline while waiting. The run will produce it, and
+  anything you do meanwhile is duplicated and fills your context with file
+  contents (section 1).
+- Do not predict, summarize, or "preliminarily report" a result you do not have.
+
+Not every wake-up is the result. A subagent message, a user message, a cron
+firing, or a ScheduleWakeup all re-enter your context while the run continues.
+Only a `<task-notification>` that names your `runId` means it finished. On any
+other wake-up: handle whatever it was, run `date` to get the real elapsed time,
+and end the turn again.
+
+If the user asks whether it is done and it is not: say it is still running, give
+elapsed against expected, and end the turn again. If you must check liveness, do
+it once with `wc -l` or `tail -n 1` on `journal.jsonl`, never `cat`: the file is
+large and belongs in the run's context, not yours. A run is alive if the line
+count has grown since you last looked. If it has not grown for longer than twice
+the estimate, report that to the user with the last journal line and let them
+decide. Do not stop or re-launch on your own.

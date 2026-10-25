@@ -52,6 +52,7 @@ context fills and quality drops. One launch, one wait, one result.
 | Understand | 9b | an overview plus the file list the job touches |
 | Design | 9c | one plan with the files to change and the tests to run |
 | Implement | 9e | verified diffs, retried once in-script when refuted |
+| Integrate | 9g | all accepted diffs applied together, built and tested |
 | Review | 9a | confirmed findings over the diffs |
 | Report | one top-tier agent | what to apply, what was left out, and why |
 
@@ -83,9 +84,9 @@ const ceiling = (base) => B ? Math.max(base, Math.floor(B / 100_000)) : base
 
 | Task shape | Count = one per | Small job | Heavy job ceiling |
 |---|---|---|---|
-| Review / audit | file touched, times lens | 1 lens | 10 lenses |
+| Review / audit | file batch (BATCH files), times lens | 1 lens | 10 lenses |
 | Understand | module / package | 1 reader | 6 readers |
-| Design | distinct angle | 2 proposals | 5 proposals, 3 judges |
+| Design | distinct angle | 2 proposals | 5 proposals, 1 judge per criterion (3) |
 | Research | sweep mode (7 canned) | 3 modes | 7 modes + 1 critic |
 | Migrate / implement | changed file | 1 transformer + 1 verifier | every file |
 | Discovery loop | lens, each round | full lens set | cap 8 rounds |
@@ -256,10 +257,13 @@ const SWEEP_MODES = [
 ]
 
 const DESIGN_ANGLES = ['MVP-first', 'risk-first', 'user-experience-first', 'operability-first', 'performance-first']
+
+const JUDGE_CRITERIA = ['correctness and risk: will it work, what breaks, how it fails', 'simplicity: the least code and fewest moving parts that fully solve it', 'fit: matches the existing code patterns, interfaces, and conventions']
 ```
 
-Take `REVIEW_LENSES.slice(0, FLEET)` and so on. If FLEET exceeds the list, repeat
-lenses with a different `label` suffix and a different file subset.
+Take `REVIEW_LENSES.slice(0, FLEET)` and so on. A finder gets one lens and one
+batch of `BATCH` files (section 9), never the whole file list: an agent told to
+read 60 files fully skims them. More files means more batches, not more lenses.
 
 ## 9. Templates
 
@@ -276,9 +280,15 @@ const CHECK    = { type: 'object', properties: { real: { type: 'boolean' }, repr
 const MERGED   = { type: 'object', properties: { findings: { type: 'array', items: { type: 'object', properties: { file: { type: 'string' }, line: { type: 'integer' }, title: { type: 'string' }, detail: { type: 'string' }, severity: LEVEL, lenses: { type: 'array', items: { type: 'string' } } }, required: ['file', 'title', 'detail', 'severity', 'lenses'] } } }, required: ['findings'] }
 const MERGE_ASK = 'Merge these review findings. Group findings that describe the same defect: same root cause, even when worded differently or reported a few lines apart. Distinct defects on nearby lines stay separate. Return one finding per group with the clearest title, the most complete detail, the highest severity in the group, and every lens that reported it in lenses. Drop a finding only when it duplicates another or is already in the known list.'
 const VERIFY_ASK = 'Verify this finding. Read the code yourself. Answer three questions: real, is the claim actually true in this code; reproducible, can it be triggered with a concrete input; impact, how much it matters in practice. A defect that is hard to reproduce or low in impact is still real; only set real=false when the claim is wrong. Set confidence=low when the code does not settle it, instead of guessing.'
+const SCORE    = { type: 'object', properties: { scores: { type: 'array', items: { type: 'object', properties: { index: { type: 'integer' }, score: { type: 'number' }, why: { type: 'string' } }, required: ['index', 'score'] } } }, required: ['scores'] }
+const BUILD    = { type: 'object', properties: { applied: { type: 'boolean' }, passed: { type: 'boolean' }, commands: { type: 'array', items: { type: 'string' } }, failures: { type: 'array', items: { type: 'object', properties: { file: { type: 'string' }, error: { type: 'string' } }, required: ['file', 'error'] } } }, required: ['applied', 'passed', 'commands', 'failures'] }
+const INTEGRATE_ASK = 'Apply every diff below to this checkout with git apply, in order. Do not commit. Then run the project build and the listed tests; if none are listed, find and run the standard build and test commands. Report every command you ran. Attribute each failure to the file whose change caused it, with the error text. passed=true only when every diff applied and every command succeeded.'
 const AGENT_RULES = 'Your final text is your return value and the script collects it. Do not call SendMessage or ListAgents; nothing needs to reach the main conversation. Put everything the script needs in this response.'
 // fan(items, fn): run fn(item, index) over every item concurrently, drop nulls.
 const fan = async (items, fn) => (await parallel(items.map((x, i) => () => fn(x, i)))).filter(Boolean)
+// chunk(xs, n): split a work list into batches of n. Finders get one batch each.
+const BATCH = 6
+const chunk = (xs, n) => xs.length ? [xs.slice(0, n), ...chunk(xs.slice(n), n)] : []
 // verifyAll(findings, verify, cap): one Opus check per finding; then, with every verdict
 // in hand, Fable re-checks the `cap` candidates that matter most (failed or unsure Opus
 // verdicts and high-severity findings, ranked by severity then confidence). Impact
@@ -293,6 +303,21 @@ const verifyAll = async (findings, verify, cap) => {
   const final = await fan(checked, async x => picked.has(x) ? { f: x.f, c: (await verify(x.f, MODEL_TOP, 'escalate')) ?? x.c, escalated: true } : x)
   return final.map(({ f, c, escalated = false }) => c ? { ...f, severity: c.impact, check: c, escalated, unsettled: c.confidence === 'low', survives: c.real } : { ...f, check: null, escalated, unsettled: true, survives: true })
 }
+// judgeDesigns(proposals, about, phase): one Fable judge per JUDGE_CRITERIA entry, each
+// shown the proposals in a different rotation so position bias does not pick the
+// winner. A proposal's total averages only the scores judges actually gave it.
+// Returns null when no judge returned scores, so the caller stops instead of
+// silently picking proposal #0.
+const judgeDesigns = async (proposals, about, phase) => {
+  const view = k => proposals.map((_, i) => (i + k) % proposals.length).map(i => '--- #' + i + '\n' + proposals[i]).join('\n')
+  const score = (c, k) => agent(`Judge these designs for: ${about}\nScore each 0-10 on ONE criterion only: ${c}. Refer to each by its # number.\n${view(k)}\n${AGENT_RULES}`, { label: `judge:${c.split(':')[0]}`, phase, schema: SCORE, model: MODEL_TOP })
+  const judged = await fan(JUDGE_CRITERIA, score)
+  if (!judged.length) return null
+  const given = i => judged.map(j => j.scores.find(x => x.index === i)?.score).filter(x => typeof x === 'number')
+  const avg = xs => xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : -1
+  const totals = proposals.map((_, i) => avg(given(i)))
+  return { totals, best: totals.indexOf(Math.max(...totals)), judges: judged.length }
+}
 ```
 
 Each template below lifts every `agent()` call into a named one-line function,
@@ -305,27 +330,39 @@ export const meta = { name: 'review', description: 'Multi-lens review with adver
 const MODEL_CHEAP = 'haiku', MODEL_MID = 'sonnet', MODEL_HIGH = 'opus', MODEL_TOP = 'fable'
 const REVIEW_LENSES = [/* paste from section 8 */]
 const FINDINGS = /* section 9 */, MERGED = /* section 9 */, CHECK = /* section 9 */, MERGE_ASK = /* section 9 */, VERIFY_ASK = /* section 9 */, AGENT_RULES = /* section 9 */
-const fan = /* section 9 */, RANK = /* section 9 */, verifyAll = /* section 9 */
+const fan = /* section 9 */, BATCH = /* section 9 */, chunk = /* section 9 */, RANK = /* section 9 */, verifyAll = /* section 9 */
 
 const B = budget.total || 0
 const files = args.files
-const fileList = files.join(', ')
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n))
 // One lens per file, floored at 2 and capped by the lens list; a +Nk budget raises the cap.
 const CAP = B ? Math.max(REVIEW_LENSES.length, Math.floor(B / 100_000)) : REVIEW_LENSES.length
 const FLEET = clamp(files.length, 2, CAP)
-log(`review: ${files.length} files, ${FLEET} lenses`)
+// Finders = lenses x batches. Past FINDER_CAP, trailing lenses are dropped, never files.
+const batches = chunk(files, BATCH)
+const FINDER_CAP = B ? Math.max(60, Math.floor(B / 25_000)) : 60
+const lensN = Math.max(1, Math.min(FLEET, Math.floor(FINDER_CAP / batches.length)))
+const dropped = REVIEW_LENSES.slice(lensN, FLEET).map(l => l.split(':')[0]).join(', ')
+if (dropped) log(`finder cap ${FINDER_CAP}: dropped lenses ${dropped}`)
+const jobs = REVIEW_LENSES.slice(0, lensN).flatMap(lens => batches.map((batch, bi) => ({ lens, batch, bi })))
+log(`review: ${files.length} files in ${batches.length} batches, ${lensN} lenses, ${jobs.length} finders`)
 
 // Fable re-checks are capped; a +Nk budget raises the cap.
 const ESCALATE_CAP = B ? Math.max(10, Math.floor(B / 50_000)) : 10
 
-const find = lens => agent(`Review these files through ONE lens only: ${lens}.\nFiles: ${fileList}\nRead each file fully. Report only concrete defects with file and line.\n${AGENT_RULES}`, { label: `find:${lens.split(':')[0]}`, phase: 'Find', schema: FINDINGS, model: MODEL_MID }).then(r => r && r.findings.map(f => ({ ...f, lens: lens.split(':')[0] })))
-const merge = (raw, known) => agent(`${MERGE_ASK}\nKnown:\n${known}\nFindings:\n${JSON.stringify(raw)}\n${AGENT_RULES}`, { label: 'merge', phase: 'Merge', schema: MERGED, model: MODEL_MID })
+const find = j => agent(`Review these files through ONE lens only: ${j.lens}.\nFiles: ${j.batch.join(', ')}\nRead each file fully. Report only concrete defects with file and line.\n${AGENT_RULES}`, { label: `find:${j.lens.split(':')[0]}:${j.bi}`, phase: 'Find', schema: FINDINGS, model: MODEL_MID }).then(r => r && r.findings.map(f => ({ ...f, lens: j.lens.split(':')[0], bi: j.bi })))
+const merge = (raw, known, bi) => agent(`${MERGE_ASK}\nKnown:\n${known}\nFindings:\n${JSON.stringify(raw)}\n${AGENT_RULES}`, { label: `merge:${bi}`, phase: 'Merge', schema: MERGED, model: MODEL_MID })
+// One merge per batch: duplicates come from different lenses reading the same files.
+const mergeBatch = async (raw, bi, known) => {
+  const group = raw.filter(f => f.bi === bi)
+  if (!group.length || (group.length < 2 && known === 'none')) return group
+  return (await merge(group, known, bi))?.findings ?? group
+}
 const verify = (f, model, tag) => agent(`${VERIFY_ASK}\n${JSON.stringify(f)}\n${AGENT_RULES}`, { label: `${tag}:${f.file}:${f.line ?? 0}`, phase: tag === 'escalate' ? 'Escalate' : 'Verify', schema: CHECK, model })
 
 // Barrier: merging needs every finder's output at once (section 6).
-const raw = (await fan(REVIEW_LENSES.slice(0, FLEET), find)).flat()
-const merged = raw.length > 1 ? (await merge(raw, 'none'))?.findings ?? raw : raw
+const raw = (await fan(jobs, find)).flat()
+const merged = (await fan(batches, (_, bi) => mergeBatch(raw, bi, 'none'))).flat()
 const verified = await verifyAll(merged, verify, ESCALATE_CAP)
 const confirmed = verified.filter(f => f.survives)
 log(`${raw.length} raw, ${merged.length} merged, ${confirmed.length} confirmed`)
@@ -336,7 +373,7 @@ return { confirmed, report }
 Call with `args: { files: [...] }`. Find, merge and verify are barriers on purpose:
 merging needs every finding at once, and ranking escalations needs every Opus
 verdict at once, so the Fable cap goes to the most severe findings, not the
-earliest. If the merge agent fails, the raw findings are verified unmerged.
+earliest. If a merge agent fails, that batch's raw findings are verified unmerged.
 
 ### 9b. Understand (one reader per module, merge)
 
@@ -361,19 +398,18 @@ touches. A two-module job gets two readers, not six.
 export const meta = { name: 'design-panel', description: 'Independent designs from several angles, judged, synthesized', phases: [{ title: 'Propose' }, { title: 'Judge' }, { title: 'Synthesize' }] }
 const MODEL_HIGH = 'opus', MODEL_TOP = 'fable'
 const DESIGN_ANGLES = [/* section 8 */]
-const AGENT_RULES = /* section 9 */, fan = /* section 9 */
-const SCORE = { type: 'object', properties: { scores: { type: 'array', items: { type: 'object', properties: { index: { type: 'integer' }, score: { type: 'number' }, why: { type: 'string' } }, required: ['index', 'score'] } } }, required: ['scores'] }
+const JUDGE_CRITERIA = [/* section 8 */]
+const SCORE = /* section 9 */, AGENT_RULES = /* section 9 */, fan = /* section 9 */, judgeDesigns = /* section 9 */
 const B = budget.total || 0
 // 2 proposals for a small design, up to the angle list; a +Nk budget adds rows.
 const N = Math.max(2, Math.min(DESIGN_ANGLES.length, 2 + Math.floor(B / 150_000)))
 const propose = a => agent(`Problem: ${args.problem}\nContext: ${args.context}\nDesign a solution from the ${a} angle. Return the design as text with tradeoffs.\n${AGENT_RULES}`, { label: `propose:${a}`, phase: 'Propose', model: MODEL_HIGH })
 const proposals = await fan(DESIGN_ANGLES.slice(0, N), propose)
-const listed = proposals.map((p, i) => '--- #' + i + '\n' + p).join('\n')
-const score = j => agent(`Judge #${j + 1}. Score each proposal 0-10 against: ${args.problem}\n${listed}\n${AGENT_RULES}`, { phase: 'Judge', schema: SCORE, model: MODEL_TOP })
-const judged = await fan([0, 1, 2], score)
-const totals = proposals.map((_, i) => judged.reduce((t, j) => t + (j.scores.find(x => x.index === i)?.score ?? 0), 0))
-const best = totals.indexOf(Math.max(...totals))
-log(`winner #${best}, totals ${JSON.stringify(totals)}`)
+if (!proposals.length) return { stopped: 'every proposer failed' }
+const ranked = await judgeDesigns(proposals, args.problem, 'Judge')
+if (!ranked) return { proposals, stopped: 'every judge failed' }
+const { totals, best } = ranked
+log(`winner #${best} by ${ranked.judges} judges, totals ${JSON.stringify(totals)}`)
 const others = proposals.filter((_, i) => i !== best).join('\n---\n')
 const final = await agent(`Synthesize the final design from the winner, grafting the best ideas from the others. End with an ordered implementation plan listing files to change.\nWinner:\n${proposals[best]}\nOthers:\n${others}\n${AGENT_RULES}`, { phase: 'Synthesize', model: MODEL_TOP })
 return { final, totals }
@@ -389,7 +425,8 @@ const MODEL_CHEAP = 'haiku', MODEL_MID = 'sonnet', MODEL_TOP = 'fable'
 const SWEEP_MODES = [/* section 8 */]
 const AGENT_RULES = /* section 9 */, fan = /* section 9 */
 const HITS = { type: 'object', properties: { hits: { type: 'array', items: { type: 'string' } } }, required: ['hits'] }
-const CAP = 40
+// 40 reads by default; a +Nk budget raises the cap.
+const CAP = budget.total ? Math.max(40, Math.floor(budget.total / 25_000)) : 40
 const sweep = m => agent(`Search ${m} for anything relevant to: ${args.question}. Return file paths only.\n${AGENT_RULES}`, { label: `sweep:${m.slice(3, 20)}`, phase: 'Sweep', schema: HITS, model: MODEL_CHEAP })
 const sweeps = await fan(SWEEP_MODES, sweep)
 const list = [...new Set(sweeps.flatMap(r => r.hits))]
@@ -409,9 +446,9 @@ the workflow and relaunch for the gaps, and do not read them inline.
 ### 9e. Implement / migrate (one agent per file, verified)
 
 ```js
-export const meta = { name: 'implement', description: 'Apply a change per file in isolated worktrees, verify each', phases: [{ title: 'Transform' }, { title: 'Verify' }] }
+export const meta = { name: 'implement', description: 'Apply a change per file in isolated worktrees, verify each, build them together', phases: [{ title: 'Transform' }, { title: 'Verify' }, { title: 'Integrate' }] }
 const MODEL_MID = 'sonnet', MODEL_HIGH = 'opus'
-const AGENT_RULES = /* section 9 */, VERDICT = /* section 9 */
+const AGENT_RULES = /* section 9 */, VERDICT = /* section 9 */, BUILD = /* section 9 */, INTEGRATE_ASK = /* section 9 */
 const RESULT = { type: 'object', properties: { changed: { type: 'boolean' }, diff: { type: 'string' }, notes: { type: 'string' } }, required: ['changed'] }
 log(`implement: ${args.files.length} files`)
 const tx = f => agent(`Task: ${args.task}\nApply it to ${f} only. Do not commit. Return the unified diff.\n${AGENT_RULES}`, { label: `tx:${f}`, phase: 'Transform', schema: RESULT, isolation: 'worktree', model: MODEL_MID })
@@ -424,28 +461,35 @@ const verify = async (r, f) => {
 const out = await pipeline(args.files, tx, verify)
 const results = out.filter(Boolean)
 log(`${results.length} changed, ${results.filter(r => r.verdict?.refuted).length} refuted`)
-return results
+// The diff checker only reads one file's diff; only a real build of all of them proves they fit.
+const passing = results.filter(r => r.verdict && !r.verdict.refuted)
+const diffs = passing.map(r => '--- ' + r.file + '\n' + r.diff).join('\n')
+const tests = (args.tests ?? []).join(', ') || 'none listed'
+const integrate = () => agent(`${INTEGRATE_ASK}\nTests: ${tests}\n${diffs}\n${AGENT_RULES}`, { label: 'integrate', phase: 'Integrate', schema: BUILD, isolation: 'worktree', model: MODEL_MID })
+const build = passing.length ? await integrate() : null
+log(`integrate: ${build ? (build.passed ? 'passed' : build.failures.length + ' failures') : 'not run'}`)
+return { results, build }
 ```
 
-Call with `args: { files: [...], task: "..." }`. Worktree isolation is required
-here because files are edited concurrently. Applying the surviving diffs is the
-one inline step allowed afterwards. Refuted files are retried inside the script,
+Call with `args: { files: [...], task: "...", tests: [...] }`; `tests` is optional.
+Worktree isolation is required here because files are edited concurrently.
+Applying the surviving diffs is the one inline step allowed afterwards, and only
+when `build.passed`. Refuted files are retried inside the script,
 not in a second workflow: add a stage that re-runs the transform with the
 verdict's reason appended to the prompt, then verifies again, as in 9g.
 
 ### 9f. Discovery loop (until dry)
 
 ```js
-// merge, verify, ESCALATE_CAP as defined in 9a; RANK and verifyAll from section 9.
+// batches, jobs, merge, mergeBatch, verify, ESCALATE_CAP as defined in 9a.
 const seen = [], confirmed = []
-const fileList = args.files.join(', ')
+const knownIn = b => seen.filter(f => b.includes(f.file)).map(f => f.file + ':' + (f.line ?? 0) + ' ' + f.title).join('\n') || 'none'
 let dry = 0, round = 0, escalations = ESCALATE_CAP   // shared across rounds
 while (dry < 2 && round < 8) {
   round++
-  const known = seen.map(f => f.file + ':' + (f.line ?? 0) + ' ' + f.title).join('\n') || 'none'
-  const find = (lens, i) => agent(`Round ${round}. Lens: ${lens}. Find defects in ${fileList} not in this list:\n${known}\n${AGENT_RULES}`, { label: `find:${round}:${i}`, phase: 'Find', schema: FINDINGS, model: MODEL_MID }).then(r => r && r.findings.map(f => ({ ...f, lens: lens.split(':')[0] })))
-  const raw = (await fan(REVIEW_LENSES.slice(0, FLEET), find)).flat()
-  const fresh = raw.length ? (await merge(raw, known))?.findings ?? raw : []
+  const find = j => agent(`Round ${round}. Lens: ${j.lens}. Find defects in ${j.batch.join(', ')} not in this list:\n${knownIn(j.batch)}\n${AGENT_RULES}`, { label: `find:${round}:${j.lens.split(':')[0]}:${j.bi}`, phase: 'Find', schema: FINDINGS, model: MODEL_MID }).then(r => r && r.findings.map(f => ({ ...f, lens: j.lens.split(':')[0], bi: j.bi })))
+  const raw = (await fan(jobs, find)).flat()
+  const fresh = (await fan(batches, (b, bi) => mergeBatch(raw, bi, knownIn(b)))).flat()
   if (!fresh.length) { dry++; continue }
   dry = 0
   seen.push(...fresh)
@@ -456,7 +500,7 @@ while (dry < 2 && round < 8) {
 }
 ```
 
-The merge step dedups each round against `seen` (every earlier finding, confirmed
+Each batch's merge dedups the round against `seen` (every earlier finding, confirmed
 or not), so rejected findings and rewordings of known ones do not come back.
 
 ### 9g. End-to-end job (understand, design, implement, review, report)
@@ -465,14 +509,14 @@ The default for any heavy job. Each phase sizes itself from the list the previou
 phase produced, so counts differ by phase as section 2 requires.
 
 ```js
-export const meta = { name: 'job', description: 'Understand, design, implement, review and report one job in a single run', phases: [{ title: 'Understand' }, { title: 'Design' }, { title: 'Implement' }, { title: 'Review' }, { title: 'Report' }] }
+export const meta = { name: 'job', description: 'Understand, design, implement, review and report one job in a single run', phases: [{ title: 'Understand' }, { title: 'Design' }, { title: 'Implement' }, { title: 'Integrate' }, { title: 'Review' }, { title: 'Report' }] }
 const MODEL_CHEAP = 'haiku', MODEL_MID = 'sonnet', MODEL_HIGH = 'opus', MODEL_TOP = 'fable'
-const REVIEW_LENSES = [/* section 8 */], DESIGN_ANGLES = [/* section 8 */]
-const FINDINGS = /* section 9 */, VERDICT = /* section 9 */, MERGED = /* section 9 */, CHECK = /* section 9 */, MERGE_ASK = /* section 9 */, VERIFY_ASK = /* section 9 */, AGENT_RULES = /* section 9 */
-const fan = /* section 9 */, RANK = /* section 9 */, verifyAll = /* section 9 */
+const REVIEW_LENSES = [/* section 8 */], DESIGN_ANGLES = [/* section 8 */], JUDGE_CRITERIA = [/* section 8 */]
+const FINDINGS = /* section 9 */, VERDICT = /* section 9 */, MERGED = /* section 9 */, CHECK = /* section 9 */, SCORE = /* section 9 */, BUILD = /* section 9 */
+const MERGE_ASK = /* section 9 */, VERIFY_ASK = /* section 9 */, INTEGRATE_ASK = /* section 9 */, AGENT_RULES = /* section 9 */
+const fan = /* section 9 */, BATCH = /* section 9 */, chunk = /* section 9 */, RANK = /* section 9 */, verifyAll = /* section 9 */, judgeDesigns = /* section 9 */
 const MAP = { type: 'object', properties: { module: { type: 'string' }, purpose: { type: 'string' }, files: { type: 'array', items: { type: 'string' } }, risks: { type: 'array', items: { type: 'string' } } }, required: ['module', 'purpose', 'files'] }
 const OVERVIEW = { type: 'object', properties: { overview: { type: 'string' }, files: { type: 'array', items: { type: 'string' } } }, required: ['overview', 'files'] }
-const SCORE = { type: 'object', properties: { scores: { type: 'array', items: { type: 'object', properties: { index: { type: 'integer' }, score: { type: 'number' }, why: { type: 'string' } }, required: ['index', 'score'] } } }, required: ['scores'] }
 const PLAN = { type: 'object', properties: { design: { type: 'string' }, files: { type: 'array', items: { type: 'object', properties: { path: { type: 'string' }, change: { type: 'string' } }, required: ['path', 'change'] } }, tests: { type: 'array', items: { type: 'string' } } }, required: ['design', 'files'] }
 const RESULT = { type: 'object', properties: { changed: { type: 'boolean' }, diff: { type: 'string' }, notes: { type: 'string' } }, required: ['changed'] }
 const B = budget.total || 0
@@ -492,12 +536,11 @@ const N = Math.max(2, Math.min(DESIGN_ANGLES.length, 2 + Math.floor(B / 150_000)
 const involved = understood.files.join(', ')
 const propose = a => agent(`Task: ${task}\nCodebase overview:\n${understood.overview}\nFiles involved: ${involved}\nDesign a solution from the ${a} angle, with tradeoffs.\n${AGENT_RULES}`, { label: `propose:${a}`, phase: 'Design', model: MODEL_HIGH })
 const proposals = await fan(DESIGN_ANGLES.slice(0, N), propose)
-const listed = proposals.map((p, i) => '--- #' + i + '\n' + p).join('\n')
-const score = j => agent(`Judge #${j + 1}. Score each proposal 0-10 for: ${task}\n${listed}\n${AGENT_RULES}`, { phase: 'Design', schema: SCORE, model: MODEL_TOP })
-const judged = await fan([0, 1, 2], score)
-const totals = proposals.map((_, i) => judged.reduce((t, j) => t + (j.scores.find(x => x.index === i)?.score ?? 0), 0))
-const best = totals.indexOf(Math.max(...totals))
-log(`design: winner #${best}, totals ${JSON.stringify(totals)}`)
+if (!proposals.length) return { understood, stopped: 'every proposer failed' }
+const ranked = await judgeDesigns(proposals, task, 'Design')
+if (!ranked) return { understood, proposals, stopped: 'every judge failed' }
+const { totals, best } = ranked
+log(`design: winner #${best} by ${ranked.judges} judges, totals ${JSON.stringify(totals)}`)
 const others = proposals.filter((_, i) => i !== best).join('\n---\n')
 const plan = await agent(`Task: ${task}\nSynthesize the final design from the winner, grafting the best ideas from the others. Return the design, the exact files to change with the change for each, and the tests to run.\nWinner:\n${proposals[best]}\nOthers:\n${others}\n${AGENT_RULES}`, { phase: 'Design', schema: PLAN, model: MODEL_TOP })
 if (!plan?.files?.length) return { understood, proposals, totals, stopped: 'design produced no file list' }
@@ -522,29 +565,56 @@ const accepted = implemented.filter(x => x.verdict && !x.verdict.refuted)
 const rejected = implemented.filter(x => !x.verdict || x.verdict.refuted)
 log(`implement: ${accepted.length} accepted, ${rejected.length} rejected after retry`)
 
-// Review: lenses over the accepted diffs, merged, verified once, escalated as in 9a.
-const diffText = accepted.map(a => '--- ' + a.file + '\n' + a.diff).join('\n')
+// Integrate: every accepted diff applied together in one worktree, built and tested.
+// Files the build blames are re-transformed once with the error and the other diffs,
+// then the whole set is rebuilt; the rebuild is the check for those retries.
+const diffsOf = set => set.map(a => '--- ' + a.file + '\n' + a.diff).join('\n')
+const tests = (plan.tests ?? []).join(', ') || 'none listed'
+const integrate = n => agent(`${INTEGRATE_ASK}\nTests: ${tests}\n${diffsOf(accepted)}\n${AGENT_RULES}`, { label: `integrate:${n}`, phase: 'Integrate', schema: BUILD, isolation: 'worktree', model: MODEL_MID })
+let build = accepted.length ? await integrate(1) : null
+const blamed = new Set((build?.failures ?? []).map(x => x.file))
+const refix = async a => {
+  const why = build.failures.filter(x => x.file === a.file).map(x => x.error).join('; ')
+  const others = diffsOf(accepted.filter(o => o.file !== a.file))
+  const r = await tx(plan.files.find(p => p.path === a.file), `\nThe combined build failed on this file: ${why}\nThe other files change as follows:\n${others}\nFix this file only.`)
+  return r?.changed ? { ...a, diff: r.diff, retried: true } : a
+}
+if (build && !build.passed && accepted.some(a => blamed.has(a.file))) {
+  const fixed = await fan(accepted, async a => blamed.has(a.file) ? refix(a) : a)
+  accepted.splice(0, accepted.length, ...fixed)
+  build = await integrate(2)
+}
+log(`integrate: ${build ? (build.passed ? 'passed' : build.failures.length + ' failures') : 'not run'}`)
+
+// Review: lenses over batches of the accepted diffs, merged, verified once, escalated as in 9a.
+const diffFor = file => diffsOf(accepted.filter(a => a.file === file)) || diffsOf(accepted)
+const batches = chunk(accepted, BATCH)
 const LENSES = REVIEW_LENSES.slice(0, Math.max(2, Math.min(REVIEW_LENSES.length, accepted.length)))
-const find = lens => agent(`Review these diffs through ONE lens only: ${lens}.\nTask: ${task}\n${diffText}\nReport only concrete defects with file and line.\n${AGENT_RULES}`, { label: `find:${lens.split(':')[0]}`, phase: 'Review', schema: FINDINGS, model: MODEL_MID }).then(r => r && r.findings.map(f => ({ ...f, lens: lens.split(':')[0] })))
-const merge = raw => agent(`${MERGE_ASK}\nKnown:\nnone\nFindings:\n${JSON.stringify(raw)}\n${AGENT_RULES}`, { label: 'merge', phase: 'Review', schema: MERGED, model: MODEL_MID })
-const verify = (f, model, tag) => agent(`${VERIFY_ASK}\n${JSON.stringify(f)}\nDiff:\n${diffText}\n${AGENT_RULES}`, { label: `${tag}:${f.file}:${f.line ?? 0}`, phase: 'Review', schema: CHECK, model })
+const jobs = LENSES.flatMap(lens => batches.map((batch, bi) => ({ lens, batch, bi })))
+const find = j => agent(`Review these diffs through ONE lens only: ${j.lens}.\nTask: ${task}\n${diffsOf(j.batch)}\nReport only concrete defects with file and line.\n${AGENT_RULES}`, { label: `find:${j.lens.split(':')[0]}:${j.bi}`, phase: 'Review', schema: FINDINGS, model: MODEL_MID }).then(r => r && r.findings.map(f => ({ ...f, lens: j.lens.split(':')[0], bi: j.bi })))
+const merge = (group, bi) => agent(`${MERGE_ASK}\nKnown:\nnone\nFindings:\n${JSON.stringify(group)}\n${AGENT_RULES}`, { label: `merge:${bi}`, phase: 'Review', schema: MERGED, model: MODEL_MID })
+const mergeBatch = async (raw, bi) => {
+  const group = raw.filter(f => f.bi === bi)
+  return group.length < 2 ? group : (await merge(group, bi))?.findings ?? group
+}
+const verify = (f, model, tag) => agent(`${VERIFY_ASK}\n${JSON.stringify(f)}\nDiff:\n${diffFor(f.file)}\n${AGENT_RULES}`, { label: `${tag}:${f.file}:${f.line ?? 0}`, phase: 'Review', schema: CHECK, model })
 const ESCALATE_CAP = B ? Math.max(10, Math.floor(B / 50_000)) : 10
-const raw = (await fan(LENSES, find)).flat()
-const merged = raw.length > 1 ? (await merge(raw))?.findings ?? raw : raw
+const raw = (await fan(jobs, find)).flat()
+const merged = (await fan(batches, (_, bi) => mergeBatch(raw, bi))).flat()
 const confirmed = (await verifyAll(merged, verify, ESCALATE_CAP)).filter(f => f.survives)
 log(`review: ${raw.length} raw, ${merged.length} merged, ${confirmed.length} confirmed`)
 
 // Report: one top-tier agent writes what to apply and what is left.
 const rejectedJson = JSON.stringify(rejected.map(r => ({ file: r.file, reason: r.verdict?.reason })))
 const confirmedJson = JSON.stringify(confirmed, null, 2)
-const tests = (plan.tests ?? []).join(', ')
-const report = await agent(`Write the final report for: ${task}\nDesign:\n${plan.design}\nAccepted diffs: ${accepted.map(a => a.file).join(', ')}\nRejected after retry: ${rejectedJson}\nConfirmed review findings:\n${confirmedJson}\nTests to run: ${tests}\nState what to apply, what to fix first, and what was left out and why.\n${AGENT_RULES}`, { phase: 'Report', model: MODEL_TOP })
-return { understood, plan, totals, accepted, rejected, confirmed, report }
+const buildJson = JSON.stringify(build)
+const report = await agent(`Write the final report for: ${task}\nDesign:\n${plan.design}\nAccepted diffs: ${accepted.map(a => a.file).join(', ')}\nRejected after retry: ${rejectedJson}\nBuild and tests over all accepted diffs, null if not run:\n${buildJson}\nConfirmed review findings:\n${confirmedJson}\nState what to apply, what to fix first, and what was left out and why. If the build did not pass, say so first.\n${AGENT_RULES}`, { phase: 'Report', model: MODEL_TOP })
+return { understood, plan, totals, accepted, rejected, build, confirmed, report }
 ```
 
 Call with `args: { task: "...", modules: [...] }` where `modules` is the scouted
 list of directories the task touches. The dispatcher's only inline step after
-the result is applying the accepted diffs. If the report names rejected files or
+the result is applying the accepted diffs, and only when `build.passed`. If the report names rejected files or
 confirmed findings worth fixing, that is a new, smaller job: one more workflow
 over those files, not inline edits.
 
@@ -569,7 +639,7 @@ over those files, not inline edits.
 
 1. Opt-in present (section 0)?
 2. Sizing derived from the step's own work list, per section 2, with the budget only raising the cap? Counts differ between steps because the work does?
-3. Does each step produce something the next one consumes, and is every load-bearing claim checked by something independent?
+3. Does each step produce something the next one consumes, and is every load-bearing claim checked by something independent? Code changes are checked by building and testing them together, not only by reading diffs.
 4. Does the script run EVERY phase of the job, so one launch and one wait cover it? A second launch you planned for a later phase belongs inside this script.
 5. Is there any work you planned to do inline afterwards that should be in the script?
 6. `meta` first, literal, with name and description; phase titles match?

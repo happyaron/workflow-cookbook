@@ -90,8 +90,12 @@ const ceiling = (base) => B ? Math.max(base, Math.floor(B / 100_000)) : base
 | Migrate / implement | changed file | 1 transformer + 1 verifier | every file |
 | Discovery loop | lens, each round | full lens set | cap 8 rounds |
 
-Refuters stay at 3 per finding: a majority verdict needs three, so that one does
-not scale down. Everything else scales with its step's work list.
+Verification is one verifier per finding, asked every question in one call, plus
+a Fable escalation for the findings where a wrong verdict costs most (section 9a).
+Do not fan several lens-verifiers over one finding and vote: lenses asking
+different questions are not independent checks, and a 2-of-3 vote drops real
+bugs that are merely hard to reproduce or low in impact. Everything else scales
+with its step's work list.
 
 **A step exists only if it produces something the next step consumes.** The phase
 lists under section 9 are the shape for that kind of task, not a mandated number
@@ -199,7 +203,7 @@ to real backend model IDs via environment variables, so scripts stay portable.
 ```js
 const MODEL_CHEAP = 'haiku'    // search, grep, reformat, sweeps
 const MODEL_MID   = 'sonnet'   // finders, readers, transformers, single-lens checks
-const MODEL_HIGH  = 'opus'     // refuters, design proposals, tricky verification
+const MODEL_HIGH  = 'opus'     // finding verifiers, design proposals, tricky verification
 const MODEL_TOP   = 'fable'    // final synthesis, judges, scoring, decisive verification
 ```
 
@@ -252,8 +256,6 @@ const SWEEP_MODES = [
 ]
 
 const DESIGN_ANGLES = ['MVP-first', 'risk-first', 'user-experience-first', 'operability-first', 'performance-first']
-
-const VERIFY_LENSES = ['correctness: is the claim actually true in this code', 'reproduction: can it be triggered with a concrete input', 'impact: does it matter in practice or is it theoretical']
 ```
 
 Take `REVIEW_LENSES.slice(0, FLEET)` and so on. If FLEET exceeds the list, repeat
@@ -269,22 +271,41 @@ way these templates fan out; it keeps the closing parens to one per line.
 ```js
 const FINDINGS = { type: 'object', properties: { findings: { type: 'array', items: { type: 'object', properties: { file: { type: 'string' }, line: { type: 'integer' }, title: { type: 'string' }, detail: { type: 'string' }, severity: { type: 'string', enum: ['high', 'medium', 'low'] } }, required: ['file', 'title', 'detail', 'severity'] } } }, required: ['findings'] }
 const VERDICT  = { type: 'object', properties: { refuted: { type: 'boolean' }, reason: { type: 'string' } }, required: ['refuted', 'reason'] }
+const LEVEL    = { type: 'string', enum: ['high', 'medium', 'low'] }
+const CHECK    = { type: 'object', properties: { real: { type: 'boolean' }, reproducible: { type: 'boolean' }, impact: LEVEL, confidence: LEVEL, reason: { type: 'string' } }, required: ['real', 'reproducible', 'impact', 'confidence', 'reason'] }
+const MERGED   = { type: 'object', properties: { findings: { type: 'array', items: { type: 'object', properties: { file: { type: 'string' }, line: { type: 'integer' }, title: { type: 'string' }, detail: { type: 'string' }, severity: LEVEL, lenses: { type: 'array', items: { type: 'string' } } }, required: ['file', 'title', 'detail', 'severity', 'lenses'] } } }, required: ['findings'] }
+const MERGE_ASK = 'Merge these review findings. Group findings that describe the same defect: same root cause, even when worded differently or reported a few lines apart. Distinct defects on nearby lines stay separate. Return one finding per group with the clearest title, the most complete detail, the highest severity in the group, and every lens that reported it in lenses. Drop a finding only when it duplicates another or is already in the known list.'
+const VERIFY_ASK = 'Verify this finding. Read the code yourself. Answer three questions: real, is the claim actually true in this code; reproducible, can it be triggered with a concrete input; impact, how much it matters in practice. A defect that is hard to reproduce or low in impact is still real; only set real=false when the claim is wrong. Set confidence=low when the code does not settle it, instead of guessing.'
 const AGENT_RULES = 'Your final text is your return value and the script collects it. Do not call SendMessage or ListAgents; nothing needs to reach the main conversation. Put everything the script needs in this response.'
 // fan(items, fn): run fn(item, index) over every item concurrently, drop nulls.
 const fan = async (items, fn) => (await parallel(items.map((x, i) => () => fn(x, i)))).filter(Boolean)
+// verifyAll(findings, verify, cap): one Opus check per finding; then, with every verdict
+// in hand, Fable re-checks the `cap` candidates that matter most (failed or unsure Opus
+// verdicts and high-severity findings, ranked by severity then confidence). Impact
+// re-grades severity and never drops a real defect. A finding nobody could check is
+// kept as unsettled, not dropped.
+const RANK = { high: 0, medium: 1, low: 2 }
+const verifyAll = async (findings, verify, cap) => {
+  const checked = await fan(findings, async f => ({ f, c: await verify(f, MODEL_HIGH, 'verify') }))
+  const needs = x => !x.c || x.c.confidence === 'low' || x.f.severity === 'high'
+  const order = x => RANK[x.f.severity] * 3 + (x.c ? 2 - RANK[x.c.confidence] : 0)
+  const picked = new Set(checked.filter(needs).sort((a, b) => order(a) - order(b)).slice(0, cap))
+  const final = await fan(checked, async x => picked.has(x) ? { f: x.f, c: (await verify(x.f, MODEL_TOP, 'escalate')) ?? x.c, escalated: true } : x)
+  return final.map(({ f, c, escalated = false }) => c ? { ...f, severity: c.impact, check: c, escalated, unsettled: c.confidence === 'low', survives: c.real } : { ...f, check: null, escalated, unsettled: true, survives: true })
+}
 ```
 
 Each template below lifts every `agent()` call into a named one-line function,
 then fans out or pipelines over the names. Keep that shape when adapting them.
 
-### 9a. Review (find by lens, verify by 3 lenses, synthesize)
+### 9a. Review (find by lens, merge, verify once, escalate, synthesize)
 
 ```js
-export const meta = { name: 'review', description: 'Multi-lens review with adversarial verification', phases: [{ title: 'Find' }, { title: 'Verify' }, { title: 'Synthesize' }] }
+export const meta = { name: 'review', description: 'Multi-lens review with adversarial verification', phases: [{ title: 'Find' }, { title: 'Merge' }, { title: 'Verify' }, { title: 'Escalate' }, { title: 'Synthesize' }] }
 const MODEL_CHEAP = 'haiku', MODEL_MID = 'sonnet', MODEL_HIGH = 'opus', MODEL_TOP = 'fable'
 const REVIEW_LENSES = [/* paste from section 8 */]
-const VERIFY_LENSES = [/* paste from section 8 */]
-const FINDINGS = /* section 9 */, VERDICT = /* section 9 */, AGENT_RULES = /* section 9 */, fan = /* section 9 */
+const FINDINGS = /* section 9 */, MERGED = /* section 9 */, CHECK = /* section 9 */, MERGE_ASK = /* section 9 */, VERIFY_ASK = /* section 9 */, AGENT_RULES = /* section 9 */
+const fan = /* section 9 */, RANK = /* section 9 */, verifyAll = /* section 9 */
 
 const B = budget.total || 0
 const files = args.files
@@ -295,30 +316,27 @@ const CAP = B ? Math.max(REVIEW_LENSES.length, Math.floor(B / 100_000)) : REVIEW
 const FLEET = clamp(files.length, 2, CAP)
 log(`review: ${files.length} files, ${FLEET} lenses`)
 
-const key = f => `${f.file}:${f.line ?? 0}:${f.title}`
-const seen = new Set()
+// Fable re-checks are capped; a +Nk budget raises the cap.
+const ESCALATE_CAP = B ? Math.max(10, Math.floor(B / 50_000)) : 10
 
-const find = lens => agent(`Review these files through ONE lens only: ${lens}.\nFiles: ${fileList}\nRead each file fully. Report only concrete defects with file and line.\n${AGENT_RULES}`, { label: `find:${lens.split(':')[0]}`, phase: 'Find', schema: FINDINGS, model: MODEL_MID })
-const refute = (f, lens) => agent(`Lens: ${lens}.\nTry to REFUTE this finding. Read the code yourself. Default to refuted=true if uncertain.\n${JSON.stringify(f)}\n${AGENT_RULES}`, { label: `verify:${f.file}`, phase: 'Verify', schema: VERDICT, model: MODEL_HIGH })
-const dedupe = found => {
-  const fresh = (found?.findings ?? []).filter(f => !seen.has(key(f)))
-  fresh.forEach(f => seen.add(key(f)))
-  return fresh
-}
-const judge = async f => {
-  const votes = await fan(VERIFY_LENSES, lens => refute(f, lens))
-  return { ...f, votes, survives: votes.filter(v => !v.refuted).length >= 2 }
-}
+const find = lens => agent(`Review these files through ONE lens only: ${lens}.\nFiles: ${fileList}\nRead each file fully. Report only concrete defects with file and line.\n${AGENT_RULES}`, { label: `find:${lens.split(':')[0]}`, phase: 'Find', schema: FINDINGS, model: MODEL_MID }).then(r => r && r.findings.map(f => ({ ...f, lens: lens.split(':')[0] })))
+const merge = (raw, known) => agent(`${MERGE_ASK}\nKnown:\n${known}\nFindings:\n${JSON.stringify(raw)}\n${AGENT_RULES}`, { label: 'merge', phase: 'Merge', schema: MERGED, model: MODEL_MID })
+const verify = (f, model, tag) => agent(`${VERIFY_ASK}\n${JSON.stringify(f)}\n${AGENT_RULES}`, { label: `${tag}:${f.file}:${f.line ?? 0}`, phase: tag === 'escalate' ? 'Escalate' : 'Verify', schema: CHECK, model })
 
-const verified = await pipeline(REVIEW_LENSES.slice(0, FLEET), find, dedupe, fresh => fan(fresh, judge))
-const confirmed = verified.flat().filter(Boolean).filter(f => f.survives)
-log(`${seen.size} raw findings, ${confirmed.length} confirmed`)
-const report = await agent(`Write the review report. Most severe first. Each item: file:line, what is wrong, why it matters, suggested fix.\n${JSON.stringify(confirmed, null, 2)}\n${AGENT_RULES}`, { phase: 'Synthesize', model: MODEL_TOP })
+// Barrier: merging needs every finder's output at once (section 6).
+const raw = (await fan(REVIEW_LENSES.slice(0, FLEET), find)).flat()
+const merged = raw.length > 1 ? (await merge(raw, 'none'))?.findings ?? raw : raw
+const verified = await verifyAll(merged, verify, ESCALATE_CAP)
+const confirmed = verified.filter(f => f.survives)
+log(`${raw.length} raw, ${merged.length} merged, ${confirmed.length} confirmed`)
+const report = await agent(`Write the review report. Most severe first. Each item: file:line, what is wrong, why it matters, suggested fix. List items with unsettled=true separately as needing a human look.\n${JSON.stringify(confirmed, null, 2)}\n${AGENT_RULES}`, { phase: 'Synthesize', model: MODEL_TOP })
 return { confirmed, report }
 ```
 
-Call with `args: { files: [...] }`. The dedup here is per-lens against a shared
-`seen`, which is fine inside a pipeline because `Set` is shared across items.
+Call with `args: { files: [...] }`. Find, merge and verify are barriers on purpose:
+merging needs every finding at once, and ranking escalations needs every Opus
+verdict at once, so the Fable cap goes to the most severe findings, not the
+earliest. If the merge agent fails, the raw findings are verified unmerged.
 
 ### 9b. Understand (one reader per module, merge)
 
@@ -418,25 +436,28 @@ verdict's reason appended to the prompt, then verifies again, as in 9g.
 ### 9f. Discovery loop (until dry)
 
 ```js
-const seen = new Set(), confirmed = []
+// merge, verify, ESCALATE_CAP as defined in 9a; RANK and verifyAll from section 9.
+const seen = [], confirmed = []
 const fileList = args.files.join(', ')
-let dry = 0, round = 0
+let dry = 0, round = 0, escalations = ESCALATE_CAP   // shared across rounds
 while (dry < 2 && round < 8) {
   round++
-  const known = [...seen].join('\n')
-  const find = (lens, i) => agent(`Round ${round}. Lens: ${lens}. Find defects in ${fileList} not in this list:\n${known}\n${AGENT_RULES}`, { label: `find:${i}`, phase: 'Find', schema: FINDINGS, model: MODEL_MID })
-  const found = (await fan(REVIEW_LENSES.slice(0, FLEET), find)).flatMap(r => r.findings)
-  const fresh = found.filter(f => !seen.has(key(f)))
+  const known = seen.map(f => f.file + ':' + (f.line ?? 0) + ' ' + f.title).join('\n') || 'none'
+  const find = (lens, i) => agent(`Round ${round}. Lens: ${lens}. Find defects in ${fileList} not in this list:\n${known}\n${AGENT_RULES}`, { label: `find:${round}:${i}`, phase: 'Find', schema: FINDINGS, model: MODEL_MID }).then(r => r && r.findings.map(f => ({ ...f, lens: lens.split(':')[0] })))
+  const raw = (await fan(REVIEW_LENSES.slice(0, FLEET), find)).flat()
+  const fresh = raw.length ? (await merge(raw, known))?.findings ?? raw : []
   if (!fresh.length) { dry++; continue }
   dry = 0
-  fresh.forEach(f => seen.add(key(f)))
-  const judged = await fan(fresh, judge)   // judge as defined in 9a
+  seen.push(...fresh)
+  const judged = await verifyAll(fresh, verify, escalations)
+  escalations -= judged.filter(j => j.escalated).length
   confirmed.push(...judged.filter(j => j.survives))
-  log(`round ${round}: ${fresh.length} new, ${confirmed.length} confirmed`)
+  log(`round ${round}: ${raw.length} raw, ${fresh.length} new, ${confirmed.length} confirmed`)
 }
 ```
 
-Dedup against `seen`, not `confirmed`, or rejected findings reappear each round.
+The merge step dedups each round against `seen` (every earlier finding, confirmed
+or not), so rejected findings and rewordings of known ones do not come back.
 
 ### 9g. End-to-end job (understand, design, implement, review, report)
 
@@ -446,8 +467,9 @@ phase produced, so counts differ by phase as section 2 requires.
 ```js
 export const meta = { name: 'job', description: 'Understand, design, implement, review and report one job in a single run', phases: [{ title: 'Understand' }, { title: 'Design' }, { title: 'Implement' }, { title: 'Review' }, { title: 'Report' }] }
 const MODEL_CHEAP = 'haiku', MODEL_MID = 'sonnet', MODEL_HIGH = 'opus', MODEL_TOP = 'fable'
-const REVIEW_LENSES = [/* section 8 */], VERIFY_LENSES = [/* section 8 */], DESIGN_ANGLES = [/* section 8 */]
-const FINDINGS = /* section 9 */, VERDICT = /* section 9 */, AGENT_RULES = /* section 9 */, fan = /* section 9 */
+const REVIEW_LENSES = [/* section 8 */], DESIGN_ANGLES = [/* section 8 */]
+const FINDINGS = /* section 9 */, VERDICT = /* section 9 */, MERGED = /* section 9 */, CHECK = /* section 9 */, MERGE_ASK = /* section 9 */, VERIFY_ASK = /* section 9 */, AGENT_RULES = /* section 9 */
+const fan = /* section 9 */, RANK = /* section 9 */, verifyAll = /* section 9 */
 const MAP = { type: 'object', properties: { module: { type: 'string' }, purpose: { type: 'string' }, files: { type: 'array', items: { type: 'string' } }, risks: { type: 'array', items: { type: 'string' } } }, required: ['module', 'purpose', 'files'] }
 const OVERVIEW = { type: 'object', properties: { overview: { type: 'string' }, files: { type: 'array', items: { type: 'string' } } }, required: ['overview', 'files'] }
 const SCORE = { type: 'object', properties: { scores: { type: 'array', items: { type: 'object', properties: { index: { type: 'integer' }, score: { type: 'number' }, why: { type: 'string' } }, required: ['index', 'score'] } } }, required: ['scores'] }
@@ -500,25 +522,17 @@ const accepted = implemented.filter(x => x.verdict && !x.verdict.refuted)
 const rejected = implemented.filter(x => !x.verdict || x.verdict.refuted)
 log(`implement: ${accepted.length} accepted, ${rejected.length} rejected after retry`)
 
-// Review: lenses over the accepted diffs, each finding refuted by three lenses.
-const key = f => `${f.file}:${f.line ?? 0}:${f.title}`
-const seen = new Set()
+// Review: lenses over the accepted diffs, merged, verified once, escalated as in 9a.
 const diffText = accepted.map(a => '--- ' + a.file + '\n' + a.diff).join('\n')
 const LENSES = REVIEW_LENSES.slice(0, Math.max(2, Math.min(REVIEW_LENSES.length, accepted.length)))
-const find = lens => agent(`Review these diffs through ONE lens only: ${lens}.\nTask: ${task}\n${diffText}\nReport only concrete defects with file and line.\n${AGENT_RULES}`, { label: `find:${lens.split(':')[0]}`, phase: 'Review', schema: FINDINGS, model: MODEL_MID })
-const refute = (f, lens) => agent(`Lens: ${lens}.\nTry to REFUTE this finding against the diff. Default to refuted=true if uncertain.\n${JSON.stringify(f)}\nDiff:\n${diffText}\n${AGENT_RULES}`, { label: `verify:${f.file}`, phase: 'Review', schema: VERDICT, model: MODEL_HIGH })
-const dedupe = found => {
-  const fresh = (found?.findings ?? []).filter(f => !seen.has(key(f)))
-  fresh.forEach(f => seen.add(key(f)))
-  return fresh
-}
-const judge = async f => {
-  const votes = await fan(VERIFY_LENSES, lens => refute(f, lens))
-  return { ...f, survives: votes.filter(v => !v.refuted).length >= 2 }
-}
-const reviewed = await pipeline(LENSES, find, dedupe, fresh => fan(fresh, judge))
-const confirmed = reviewed.flat().filter(Boolean).filter(f => f.survives)
-log(`review: ${seen.size} raw, ${confirmed.length} confirmed`)
+const find = lens => agent(`Review these diffs through ONE lens only: ${lens}.\nTask: ${task}\n${diffText}\nReport only concrete defects with file and line.\n${AGENT_RULES}`, { label: `find:${lens.split(':')[0]}`, phase: 'Review', schema: FINDINGS, model: MODEL_MID }).then(r => r && r.findings.map(f => ({ ...f, lens: lens.split(':')[0] })))
+const merge = raw => agent(`${MERGE_ASK}\nKnown:\nnone\nFindings:\n${JSON.stringify(raw)}\n${AGENT_RULES}`, { label: 'merge', phase: 'Review', schema: MERGED, model: MODEL_MID })
+const verify = (f, model, tag) => agent(`${VERIFY_ASK}\n${JSON.stringify(f)}\nDiff:\n${diffText}\n${AGENT_RULES}`, { label: `${tag}:${f.file}:${f.line ?? 0}`, phase: 'Review', schema: CHECK, model })
+const ESCALATE_CAP = B ? Math.max(10, Math.floor(B / 50_000)) : 10
+const raw = (await fan(LENSES, find)).flat()
+const merged = raw.length > 1 ? (await merge(raw))?.findings ?? raw : raw
+const confirmed = (await verifyAll(merged, verify, ESCALATE_CAP)).filter(f => f.survives)
+log(`review: ${raw.length} raw, ${merged.length} merged, ${confirmed.length} confirmed`)
 
 // Report: one top-tier agent writes what to apply and what is left.
 const rejectedJson = JSON.stringify(rejected.map(r => ({ file: r.file, reason: r.verdict?.reason })))
@@ -542,7 +556,10 @@ over those files, not inline edits.
   the script's structured results stale. Never write a prompt that asks an agent
   to notify, report to, or message main.
 - Inline every fact the agent needs. It does not see this conversation.
-- Refuters: say "Default to refuted=true if uncertain." Readers: say "Facts only."
+- Diff checkers (VERDICT): say "Refute if any answer is no." Finding verifiers
+  (CHECK): use `VERIFY_ASK`, which asks for confidence=low rather than a default
+  verdict, so uncertainty escalates instead of silently dropping the finding.
+  Readers: say "Facts only."
 - Never tell an agent to read CLAUDE.md. It already has it.
 - With a schema, do not also ask for prose.
 - Prompt text contains no backticks and no nested `${`...`}`. Name files bare;
